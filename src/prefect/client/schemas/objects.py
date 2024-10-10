@@ -3,6 +3,7 @@ import warnings
 from functools import partial
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Any,
     Dict,
     Generic,
@@ -17,10 +18,12 @@ import orjson
 import pendulum
 from pydantic import (
     ConfigDict,
+    Discriminator,
     Field,
     HttpUrl,
     IPvAnyNetwork,
     SerializationInfo,
+    Tag,
     field_validator,
     model_serializer,
     model_validator,
@@ -59,7 +62,7 @@ from prefect.utilities.names import generate_slug
 from prefect.utilities.pydantic import handle_secret_render
 
 if TYPE_CHECKING:
-    from prefect.results import BaseResult
+    from prefect.results import BaseResult, ResultRecordMetadata
 
 
 R = TypeVar("R", default=Any)
@@ -138,6 +141,30 @@ class WorkQueueStatus(AutoEnum):
     PAUSED = AutoEnum.auto()
 
 
+class ConcurrencyLimitStrategy(AutoEnum):
+    """Enumeration of concurrency limit strategies."""
+
+    ENQUEUE = AutoEnum.auto()
+    CANCEL_NEW = AutoEnum.auto()
+
+
+class ConcurrencyOptions(PrefectBaseModel):
+    """
+    Class for storing the concurrency config in database.
+    """
+
+    collision_strategy: ConcurrencyLimitStrategy
+
+
+class ConcurrencyLimitConfig(PrefectBaseModel):
+    """
+    Class for storing the concurrency limit config in database.
+    """
+
+    limit: int
+    collision_strategy: ConcurrencyLimitStrategy = ConcurrencyLimitStrategy.ENQUEUE
+
+
 class StateDetails(PrefectBaseModel):
     flow_run_id: Optional[UUID] = None
     task_run_id: Optional[UUID] = None
@@ -158,6 +185,14 @@ class StateDetails(PrefectBaseModel):
     task_parameters_id: Optional[UUID] = None
 
 
+def data_discriminator(x: Any) -> str:
+    if isinstance(x, dict) and "type" in x:
+        return "BaseResult"
+    elif isinstance(x, dict) and "storage_key" in x:
+        return "ResultRecordMetadata"
+    return "Any"
+
+
 class State(ObjectBaseModel, Generic[R]):
     """
     The state of a run.
@@ -168,9 +203,14 @@ class State(ObjectBaseModel, Generic[R]):
     timestamp: DateTime = Field(default_factory=lambda: pendulum.now("UTC"))
     message: Optional[str] = Field(default=None, examples=["Run started"])
     state_details: StateDetails = Field(default_factory=StateDetails)
-    data: Union["BaseResult[R]", Any] = Field(
-        default=None,
-    )
+    data: Annotated[
+        Union[
+            Annotated["BaseResult[R]", Tag("BaseResult")],
+            Annotated["ResultRecordMetadata", Tag("ResultRecordMetadata")],
+            Annotated[Any, Tag("Any")],
+        ],
+        Discriminator(data_discriminator),
+    ] = Field(default=None)
 
     @overload
     def result(self: "State[R]", raise_on_failure: bool = True) -> R:
@@ -191,7 +231,9 @@ class State(ObjectBaseModel, Generic[R]):
 
         Args:
             raise_on_failure: a boolean specifying whether to raise an exception
-                if the state is of type `FAILED` and the underlying data is an exception
+                if the state is of type `FAILED` and the underlying data is an exception. When flow
+                was run in a different memory space (using `run_deployment`), this will only raise
+                if `fetch` is `True`.
             fetch: a boolean specifying whether to resolve references to persisted
                 results into data. For synchronous users, this defaults to `True`.
                 For asynchronous users, this defaults to `False` for backwards
@@ -257,6 +299,15 @@ class State(ObjectBaseModel, Generic[R]):
             >>> state = await my_flow(return_state=True)
             >>> await state.result()
             hello
+
+            Get the result with `raise_on_failure` from a flow run in a different memory space
+
+            >>> @flow
+            >>> async def my_flow():
+            >>>     raise ValueError("oh no!")
+            >>> my_flow.deploy("my_deployment/my_flow")
+            >>> flow_run = run_deployment("my_deployment/my_flow")
+            >>> await flow_run.state.result(raise_on_failure=True, fetch=True) # Raises `ValueError("oh no!")`
         """
         from prefect.states import get_state_result
 
@@ -276,10 +327,16 @@ class State(ObjectBaseModel, Generic[R]):
         results should be sent to the API. Other data is only available locally.
         """
         from prefect.client.schemas.actions import StateCreate
-        from prefect.results import BaseResult
+        from prefect.results import (
+            BaseResult,
+            ResultRecord,
+            should_persist_result,
+        )
 
-        if isinstance(self.data, BaseResult) and self.data.serialize_to_none is False:
+        if isinstance(self.data, BaseResult):
             data = self.data
+        elif isinstance(self.data, ResultRecord) and should_persist_result():
+            data = self.data.metadata
         else:
             data = None
 

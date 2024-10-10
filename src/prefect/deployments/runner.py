@@ -54,6 +54,7 @@ from prefect._internal.schemas.validators import (
 )
 from prefect.client.orchestration import get_client
 from prefect.client.schemas.actions import DeploymentScheduleCreate
+from prefect.client.schemas.objects import ConcurrencyLimitConfig, ConcurrencyOptions
 from prefect.client.schemas.schedules import (
     SCHEDULE_TYPES,
     construct_schedule,
@@ -146,6 +147,10 @@ class RunnerDeployment(BaseModel):
     concurrency_limit: Optional[int] = Field(
         default=None,
         description="The maximum number of concurrent runs of this deployment.",
+    )
+    concurrency_options: Optional[ConcurrencyOptions] = Field(
+        default=None,
+        description="The concurrency limit config for the deployment.",
     )
     paused: Optional[bool] = Field(
         default=None, description="Whether or not the deployment is paused."
@@ -279,6 +284,7 @@ class RunnerDeployment(BaseModel):
                 paused=self.paused,
                 schedules=self.schedules,
                 concurrency_limit=self.concurrency_limit,
+                concurrency_options=self.concurrency_options,
                 parameters=self.parameters,
                 description=self.description,
                 tags=self.tags,
@@ -437,7 +443,7 @@ class RunnerDeployment(BaseModel):
         rrule: Optional[Union[Iterable[str], str]] = None,
         paused: Optional[bool] = None,
         schedules: Optional["FlexibleScheduleList"] = None,
-        concurrency_limit: Optional[int] = None,
+        concurrency_limit: Optional[Union[int, ConcurrencyLimitConfig, None]] = None,
         parameters: Optional[dict] = None,
         triggers: Optional[List[Union[DeploymentTriggerTypes, TriggerTypes]]] = None,
         description: Optional[str] = None,
@@ -462,6 +468,7 @@ class RunnerDeployment(BaseModel):
             paused: Whether or not to set this deployment as paused.
             schedules: A list of schedule objects defining when to execute runs of this deployment.
                 Used to define multiple schedules or additional scheduling options like `timezone`.
+            concurrency_limit: The maximum number of concurrent runs this deployment will allow.
             triggers: A list of triggers that should kick of a run of this flow.
             parameters: A dictionary of default parameter values to pass to runs of this flow.
             description: A description for the created deployment. Defaults to the flow's
@@ -487,11 +494,20 @@ class RunnerDeployment(BaseModel):
 
         job_variables = job_variables or {}
 
+        if isinstance(concurrency_limit, ConcurrencyLimitConfig):
+            concurrency_options = {
+                "collision_strategy": concurrency_limit.collision_strategy
+            }
+            concurrency_limit = concurrency_limit.limit
+        else:
+            concurrency_options = None
+
         deployment = cls(
             name=Path(name).stem,
             flow_name=flow.name,
             schedules=constructed_schedules,
             concurrency_limit=concurrency_limit,
+            concurrency_options=concurrency_options,
             paused=paused,
             tags=tags or [],
             triggers=triggers or [],
@@ -558,6 +574,7 @@ class RunnerDeployment(BaseModel):
         cls,
         entrypoint: str,
         name: str,
+        flow_name: Optional[str] = None,
         interval: Optional[
             Union[Iterable[Union[int, float, timedelta]], int, float, timedelta]
         ] = None,
@@ -565,7 +582,7 @@ class RunnerDeployment(BaseModel):
         rrule: Optional[Union[Iterable[str], str]] = None,
         paused: Optional[bool] = None,
         schedules: Optional["FlexibleScheduleList"] = None,
-        concurrency_limit: Optional[int] = None,
+        concurrency_limit: Optional[Union[int, ConcurrencyLimitConfig, None]] = None,
         parameters: Optional[dict] = None,
         triggers: Optional[List[Union[DeploymentTriggerTypes, TriggerTypes]]] = None,
         description: Optional[str] = None,
@@ -583,6 +600,7 @@ class RunnerDeployment(BaseModel):
             entrypoint:  The path to a file containing a flow and the name of the flow function in
                 the format `./path/to/file.py:flow_func_name`.
             name: A name for the deployment
+            flow_name: The name of the flow to deploy
             interval: An interval on which to execute the current flow. Accepts either a number
                 or a timedelta object. If a number is given, it will be interpreted as seconds.
             cron: A cron schedule of when to execute runs of this flow.
@@ -618,11 +636,20 @@ class RunnerDeployment(BaseModel):
             schedules=schedules,
         )
 
+        if isinstance(concurrency_limit, ConcurrencyLimitConfig):
+            concurrency_options = {
+                "collision_strategy": concurrency_limit.collision_strategy
+            }
+            concurrency_limit = concurrency_limit.limit
+        else:
+            concurrency_options = None
+
         deployment = cls(
             name=Path(name).stem,
-            flow_name=flow.name,
+            flow_name=flow_name or flow.name,
             schedules=constructed_schedules,
             concurrency_limit=concurrency_limit,
+            concurrency_options=concurrency_options,
             paused=paused,
             tags=tags or [],
             triggers=triggers or [],
@@ -648,6 +675,7 @@ class RunnerDeployment(BaseModel):
         storage: RunnerStorage,
         entrypoint: str,
         name: str,
+        flow_name: Optional[str] = None,
         interval: Optional[
             Union[Iterable[Union[int, float, timedelta]], int, float, timedelta]
         ] = None,
@@ -655,7 +683,7 @@ class RunnerDeployment(BaseModel):
         rrule: Optional[Union[Iterable[str], str]] = None,
         paused: Optional[bool] = None,
         schedules: Optional["FlexibleScheduleList"] = None,
-        concurrency_limit: Optional[int] = None,
+        concurrency_limit: Optional[Union[int, ConcurrencyLimitConfig, None]] = None,
         parameters: Optional[dict] = None,
         triggers: Optional[List[Union[DeploymentTriggerTypes, TriggerTypes]]] = None,
         description: Optional[str] = None,
@@ -674,6 +702,7 @@ class RunnerDeployment(BaseModel):
             entrypoint:  The path to a file containing a flow and the name of the flow function in
                 the format `./path/to/file.py:flow_func_name`.
             name: A name for the deployment
+            flow_name: The name of the flow to deploy
             storage: A storage object to use for retrieving flow code. If not provided, a
                 URL must be provided.
             interval: An interval on which to execute the current flow. Accepts either a number
@@ -705,6 +734,14 @@ class RunnerDeployment(BaseModel):
             schedules=schedules,
         )
 
+        if isinstance(concurrency_limit, ConcurrencyLimitConfig):
+            concurrency_options = {
+                "collision_strategy": concurrency_limit.collision_strategy
+            }
+            concurrency_limit = concurrency_limit.limit
+        else:
+            concurrency_options = None
+
         job_variables = job_variables or {}
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -718,9 +755,10 @@ class RunnerDeployment(BaseModel):
 
         deployment = cls(
             name=Path(name).stem,
-            flow_name=flow.name,
+            flow_name=flow_name or flow.name,
             schedules=constructed_schedules,
             concurrency_limit=concurrency_limit,
+            concurrency_options=concurrency_options,
             paused=paused,
             tags=tags or [],
             triggers=triggers or [],

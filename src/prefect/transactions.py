@@ -4,7 +4,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from functools import partial
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -19,15 +18,23 @@ from pydantic import Field, PrivateAttr
 from typing_extensions import Self
 
 from prefect.context import ContextModel
-from prefect.exceptions import MissingContextError, SerializationError
+from prefect.exceptions import (
+    ConfigurationError,
+    MissingContextError,
+    SerializationError,
+)
 from prefect.logging.loggers import get_logger, get_run_logger
 from prefect.records import RecordStore
+from prefect.records.base import TransactionRecord
+from prefect.results import (
+    BaseResult,
+    ResultRecord,
+    ResultStore,
+    get_result_store,
+)
 from prefect.utilities.annotations import NotSet
 from prefect.utilities.collections import AutoEnum
 from prefect.utilities.engine import _get_hook_name
-
-if TYPE_CHECKING:
-    from prefect.results import BaseResult
 
 
 class IsolationLevel(AutoEnum):
@@ -54,7 +61,7 @@ class Transaction(ContextModel):
     A base model for transaction state.
     """
 
-    store: Optional[RecordStore] = None
+    store: Union[RecordStore, ResultStore, None] = None
     key: Optional[str] = None
     children: List["Transaction"] = Field(default_factory=list)
     commit_mode: Optional[CommitMode] = None
@@ -68,19 +75,91 @@ class Transaction(ContextModel):
     logger: Union[logging.Logger, logging.LoggerAdapter] = Field(
         default_factory=partial(get_logger, "transactions")
     )
+    write_on_commit: bool = True
     _stored_values: Dict[str, Any] = PrivateAttr(default_factory=dict)
     _staged_value: Any = None
     __var__: ContextVar = ContextVar("transaction")
 
     def set(self, name: str, value: Any) -> None:
+        """
+        Set a stored value in the transaction.
+
+        Args:
+            name: The name of the value to set
+            value: The value to set
+
+        Examples:
+            Set a value for use later in the transaction:
+            ```python
+            with transaction() as txn:
+                txn.set("key", "value")
+                ...
+                assert txn.get("key") == "value"
+            ```
+        """
         self._stored_values[name] = value
 
     def get(self, name: str, default: Any = NotSet) -> Any:
-        if name not in self._stored_values:
-            if default is not NotSet:
-                return default
-            raise ValueError(f"Could not retrieve value for unknown key: {name}")
-        return self._stored_values.get(name)
+        """
+        Get a stored value from the transaction.
+
+        Child transactions will return values from their parents unless a value with
+        the same name is set in the child transaction.
+
+        Direct changes to returned values will not update the stored value. To update the
+        stored value, use the `set` method.
+
+        Args:
+            name: The name of the value to get
+            default: The default value to return if the value is not found
+
+        Returns:
+            The value from the transaction
+
+        Examples:
+            Get a value from the transaction:
+            ```python
+            with transaction() as txn:
+                txn.set("key", "value")
+                ...
+                assert txn.get("key") == "value"
+            ```
+
+            Get a value from a parent transaction:
+            ```python
+            with transaction() as parent:
+                parent.set("key", "parent_value")
+                with transaction() as child:
+                    assert child.get("key") == "parent_value"
+            ```
+
+            Update a stored value:
+            ```python
+            with transaction() as txn:
+                txn.set("key", [1, 2, 3])
+                value = txn.get("key")
+                value.append(4)
+                # Stored value is not updated until `.set` is called
+                assert value == [1, 2, 3, 4]
+                assert txn.get("key") == [1, 2, 3]
+
+                txn.set("key", value)
+                assert txn.get("key") == [1, 2, 3, 4]
+            ```
+        """
+        # deepcopy to prevent mutation of stored values
+        value = copy.deepcopy(self._stored_values.get(name, NotSet))
+        if value is NotSet:
+            # if there's a parent transaction, get the value from the parent
+            parent = self.get_parent()
+            if parent is not None:
+                value = parent.get(name, default)
+            # if there's no parent transaction, use the default
+            elif default is not NotSet:
+                value = default
+            else:
+                raise ValueError(f"Could not retrieve value for unknown key: {name}")
+        return value
 
     def is_committed(self) -> bool:
         return self.state == TransactionState.COMMITTED
@@ -103,8 +182,6 @@ class Transaction(ContextModel):
                 "Context already entered. Context enter calls cannot be nested."
             )
         parent = get_transaction()
-        if parent:
-            self._stored_values = copy.deepcopy(parent._stored_values)
         # set default commit behavior; either inherit from parent or set a default of eager
         if self.commit_mode is None:
             self.commit_mode = parent.commit_mode if parent else CommitMode.LAZY
@@ -120,8 +197,10 @@ class Transaction(ContextModel):
             and self.key
             and not self.store.supports_isolation_level(self.isolation_level)
         ):
-            raise ValueError(
-                f"Isolation level {self.isolation_level.name} is not supported by record store type {self.store.__class__.__name__}"
+            raise ConfigurationError(
+                f"Isolation level {self.isolation_level.name} is not supported by provided "
+                "configuration. Please ensure you've provided a lock file directory or lock "
+                "manager when using the SERIALIZABLE isolation level."
             )
 
         # this needs to go before begin, which could set the state to committed
@@ -175,10 +254,14 @@ class Transaction(ContextModel):
         ):
             self.state = TransactionState.COMMITTED
 
-    def read(self) -> Optional["BaseResult"]:
+    def read(self) -> Union["BaseResult", ResultRecord, None]:
         if self.store and self.key:
             record = self.store.read(key=self.key)
-            if record is not None:
+            if isinstance(record, ResultRecord):
+                return record
+            # for backwards compatibility, if we encounter a transaction record, return the result
+            # This happens when the transaction is using a `ResultStore`
+            if isinstance(record, TransactionRecord):
                 return record.result
         return None
 
@@ -201,11 +284,14 @@ class Transaction(ContextModel):
         self.children.append(transaction)
 
     def get_parent(self) -> Optional["Transaction"]:
-        prev_var = getattr(self._token, "old_value")
-        if prev_var != Token.MISSING:
-            parent = prev_var
+        parent = None
+        if self._token:
+            prev_var = getattr(self._token, "old_value")
+            if prev_var != Token.MISSING:
+                parent = prev_var
         else:
-            parent = None
+            # `_token` has been reset so we need to get the active transaction from the context var
+            parent = self.get_active()
         return parent
 
     def commit(self) -> bool:
@@ -227,8 +313,21 @@ class Transaction(ContextModel):
             for hook in self.on_commit_hooks:
                 self.run_hook(hook, "commit")
 
-            if self.store and self.key:
-                self.store.write(key=self.key, result=self._staged_value)
+            if self.store and self.key and self.write_on_commit:
+                if isinstance(self.store, ResultStore):
+                    if isinstance(self._staged_value, BaseResult):
+                        self.store.write(
+                            key=self.key, obj=self._staged_value.get(_sync=True)
+                        )
+                    elif isinstance(self._staged_value, ResultRecord):
+                        self.store.persist_result_record(
+                            result_record=self._staged_value
+                        )
+                    else:
+                        self.store.write(key=self.key, obj=self._staged_value)
+                else:
+                    self.store.write(key=self.key, result=self._staged_value)
+
             self.state = TransactionState.COMMITTED
             if (
                 self.store
@@ -279,7 +378,7 @@ class Transaction(ContextModel):
 
     def stage(
         self,
-        value: "BaseResult",
+        value: Any,
         on_rollback_hooks: Optional[List] = None,
         on_commit_hooks: Optional[List] = None,
     ) -> None:
@@ -337,10 +436,11 @@ def get_transaction() -> Optional[Transaction]:
 @contextmanager
 def transaction(
     key: Optional[str] = None,
-    store: Optional[RecordStore] = None,
+    store: Union[RecordStore, ResultStore, None] = None,
     commit_mode: Optional[CommitMode] = None,
     isolation_level: Optional[IsolationLevel] = None,
     overwrite: bool = False,
+    write_on_commit: bool = True,
     logger: Union[logging.Logger, logging.LoggerAdapter, None] = None,
 ) -> Generator[Transaction, None, None]:
     """
@@ -353,48 +453,16 @@ def transaction(
         - commit_mode: The commit mode controlling when the transaction and
             child transactions are committed
         - overwrite: Whether to overwrite an existing transaction record in the store
+        - write_on_commit: Whether to write the result to the store on commit. If not provided,
+            will default will be determined by the current run context. If no run context is
+            available, the value of `PREFECT_RESULTS_PERSIST_BY_DEFAULT` will be used.
 
     Yields:
         - Transaction: An object representing the transaction state
     """
     # if there is no key, we won't persist a record
     if key and not store:
-        from prefect.context import FlowRunContext, TaskRunContext
-        from prefect.results import ResultStore, get_default_result_storage
-
-        flow_run_context = FlowRunContext.get()
-        task_run_context = TaskRunContext.get()
-        existing_store = getattr(task_run_context, "result_store", None) or getattr(
-            flow_run_context, "result_store", None
-        )
-
-        new_store: ResultStore
-        if existing_store and existing_store.result_storage_block_id:
-            new_store = existing_store.model_copy(
-                update={
-                    "persist_result": True,
-                }
-            )
-        else:
-            default_storage = get_default_result_storage(_sync=True)
-            if existing_store:
-                new_store = existing_store.model_copy(
-                    update={
-                        "persist_result": True,
-                        "storage_block": default_storage,
-                        "storage_block_id": default_storage._block_document_id,
-                    }
-                )
-            else:
-                new_store = ResultStore(
-                    persist_result=True,
-                    result_storage=default_storage,
-                )
-        from prefect.records.result_store import ResultRecordStore
-
-        store = ResultRecordStore(
-            result_store=new_store,
-        )
+        store = get_result_store()
 
     try:
         logger = logger or get_run_logger()
@@ -407,6 +475,7 @@ def transaction(
         commit_mode=commit_mode,
         isolation_level=isolation_level,
         overwrite=overwrite,
+        write_on_commit=write_on_commit,
         logger=logger,
     ) as txn:
         yield txn

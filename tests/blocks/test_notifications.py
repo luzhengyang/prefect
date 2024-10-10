@@ -1,11 +1,12 @@
 import urllib
 from typing import Type
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import cloudpickle
 import pytest
 import respx
 
+from prefect.blocks.abstract import NotificationError
 from prefect.blocks.notifications import (
     PREFECT_NOTIFY_TYPE_DEFAULT,
     AppriseNotificationBlock,
@@ -30,6 +31,41 @@ notification_classes = sorted(
     ],
     key=lambda cls: cls.__name__,
 )
+
+RESTRICTED_URLS = [
+    ("", ""),
+    (" ", ""),
+    ("[]", ""),
+    ("not a url", ""),
+    ("http://", ""),
+    ("https://", ""),
+    ("ftp://example.com", "HTTP and HTTPS"),
+    ("gopher://example.com", "HTTP and HTTPS"),
+    ("https://localhost", "private address"),
+    ("https://127.0.0.1", "private address"),
+    ("https://[::1]", "private address"),
+    ("https://[fc00:1234:5678:9abc::10]", "private address"),
+    ("https://[fd12:3456:789a:1::1]", "private address"),
+    ("https://[fe80::1234:5678:9abc]", "private address"),
+    ("https://10.0.0.1", "private address"),
+    ("https://10.255.255.255", "private address"),
+    ("https://172.16.0.1", "private address"),
+    ("https://172.31.255.255", "private address"),
+    ("https://192.168.1.1", "private address"),
+    ("https://192.168.1.255", "private address"),
+    ("https://169.254.0.1", "private address"),
+    ("https://169.254.169.254", "private address"),
+    ("https://169.254.254.255", "private address"),
+    # These will resolve to a private address in production, but not in tests,
+    # so we'll use "resolve" as the reason to catch both cases
+    ("https://metadata.google.internal", "resolve"),
+    ("https://anything.privatecloud", "resolve"),
+    ("https://anything.privatecloud.svc", "resolve"),
+    ("https://anything.privatecloud.svc.cluster.local", "resolve"),
+    ("https://cluster-internal", "resolve"),
+    ("https://network-internal.cloud.svc", "resolve"),
+    ("https://private-internal.cloud.svc.cluster.local", "resolve"),
+]
 
 
 @pytest.mark.parametrize("block_class", notification_classes)
@@ -80,6 +116,36 @@ class TestAppriseNotificationBlock:
         pickled = cloudpickle.dumps(block)
         unpickled = cloudpickle.loads(pickled)
         assert isinstance(unpickled, block_class)
+
+    @pytest.mark.parametrize("value, reason", RESTRICTED_URLS)
+    async def test_notification_can_prevent_restricted_urls(
+        self, block_class, value: str, reason: str
+    ):
+        notification = block_class(url=value, allow_private_urls=False)
+
+        with pytest.raises(ValueError, match=f"is not a valid URL.*{reason}"):
+            await notification.notify(subject="example", body="example")
+
+    async def test_raises_on_url_validation_failure(self, block_class):
+        """
+        When within a raise_on_failure block, we want URL validation errors to be
+        wrapped and captured as NotificationErrors for reporting back to users.
+        """
+        block = block_class(url="https://127.0.0.1/foo/bar", allow_private_urls=False)
+
+        # outside of a raise_on_failure block, we get a ValueError directly
+        with pytest.raises(ValueError, match="not a valid URL") as captured:
+            await block.notify(subject="Test", body="Test")
+
+        # inside of a raise_on_failure block, we get a NotificationError
+        with block.raise_on_failure():
+            with pytest.raises(NotificationError) as captured:
+                await block.notify(subject="Test", body="Test")
+
+        assert captured.value.log == (
+            "'https://127.0.0.1/foo/bar' is not a valid URL.  It resolves to the "
+            "private address 127.0.0.1."
+        )
 
 
 class TestMattermostWebhook:
@@ -313,6 +379,33 @@ class TestPagerDutyWebhook:
                 body="test", title=None, notify_type=notify_type
             )
 
+    async def test_notify_async_with_subject(self):
+        with patch("apprise.Apprise", autospec=True) as AppriseMock:
+            apprise_instance_mock = AppriseMock.return_value
+            apprise_instance_mock.async_notify = AsyncMock()
+
+            block = PagerDutyWebHook(integration_key="int_key", api_key="api_key")
+            await block.notify("test", "test")
+
+            apprise_instance_mock.add.assert_has_calls(
+                [
+                    call(
+                        "pagerduty://int_key@api_key/Prefect/Notification?region=us"
+                        "&image=yes&format=text&overflow=upstream"
+                    ),
+                    call(
+                        "pagerduty://int_key@api_key/Prefect/Notification?region=us"
+                        "&image=yes&%2BPrefect+Notification+Body=test&format=text&overflow=upstream"
+                    ),
+                ],
+                any_order=False,
+            )
+
+            notify_type = "info"
+            apprise_instance_mock.async_notify.assert_awaited_once_with(
+                body=" ", title="test", notify_type=notify_type
+            )
+
     def test_notify_sync(self):
         with patch("apprise.Apprise", autospec=True) as AppriseMock:
             apprise_instance_mock = AppriseMock.return_value
@@ -335,6 +428,38 @@ class TestPagerDutyWebhook:
             notify_type = "info"
             apprise_instance_mock.async_notify.assert_awaited_once_with(
                 body="test", title=None, notify_type=notify_type
+            )
+
+    def test_notify_sync_with_subject(self):
+        with patch("apprise.Apprise", autospec=True) as AppriseMock:
+            apprise_instance_mock = AppriseMock.return_value
+            apprise_instance_mock.async_notify = AsyncMock()
+
+            block = PagerDutyWebHook(integration_key="int_key", api_key="api_key")
+
+            @flow
+            def test_flow():
+                block.notify("test", "test")
+
+            test_flow()
+
+            apprise_instance_mock.add.assert_has_calls(
+                [
+                    call(
+                        "pagerduty://int_key@api_key/Prefect/Notification?region=us"
+                        "&image=yes&format=text&overflow=upstream"
+                    ),
+                    call(
+                        "pagerduty://int_key@api_key/Prefect/Notification?region=us"
+                        "&image=yes&%2BPrefect+Notification+Body=test&format=text&overflow=upstream"
+                    ),
+                ],
+                any_order=False,
+            )
+
+            notify_type = "info"
+            apprise_instance_mock.async_notify.assert_awaited_once_with(
+                body=" ", title="test", notify_type=notify_type
             )
 
 

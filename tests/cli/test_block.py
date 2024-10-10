@@ -40,7 +40,6 @@ def test_register_blocks_from_module_with_ui_url():
             expected_output_contains=[
                 "Successfully registered",
                 "blocks",
-                "Prefect UI: https://app.prefect.cloud/blocks/catalog",
             ],
         )
 
@@ -55,7 +54,7 @@ def test_register_blocks_from_module_without_ui_url(
             expected_output_contains=[
                 "Successfully registered",
                 "blocks",
-                "Prefect UI.",
+                "Prefect UI",
             ],
             expected_output_does_not_contain=["Prefect UI: https://"],
         )
@@ -195,18 +194,21 @@ def test_listing_blocks_when_none_are_registered():
 
 
 async def test_listing_blocks_after_saving_a_block():
-    block_id = await system.JSON(value="a casual test block").save("wildblock")
+    block_id = await system.Secret(value="a casual test block").save("wildblock")
 
     await run_sync_in_worker_thread(
         invoke_and_assert,
         command=["block", "ls"],
-        expected_output_contains=f"""
-            ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
-            ┃ ID                                   ┃ Type ┃ Name      ┃ Slug           ┃
-            ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
-            │ {block_id} │ JSON │ wildblock │ json/wildblock │
-            └──────────────────────────────────────┴──────┴───────────┴────────────────┘
-            """,
+        expected_output_contains=[
+            "ID",
+            "Type",
+            "Name",
+            "Slug",
+            str(block_id),
+            "Secret",
+            "wildblock",
+            "secret/wildblock",
+        ],
     )
 
 
@@ -231,7 +233,7 @@ def test_listing_system_block_types(register_block_types):
     )
 
 
-async def test_inspecting_a_block():
+async def test_inspecting_a_block(ignore_prefect_deprecation_warnings):
     await system.JSON(value="a simple json blob").save("jsonblob")
 
     expected_output = ("Block Type", "Block id", "value", "a simple json blob")
@@ -253,18 +255,18 @@ def test_inspecting_a_block_malformed_slug():
 
 
 async def test_deleting_a_block():
-    await system.JSON(value="don't delete me please").save("pleasedonterase")
+    await system.Secret(value="don't delete me please").save("pleasedonterase")
 
     await run_sync_in_worker_thread(
         invoke_and_assert,
-        ["block", "delete", "json/pleasedonterase"],
+        ["block", "delete", "secret/pleasedonterase"],
         user_input="y",
         expected_code=0,
     )
 
     await run_sync_in_worker_thread(
         invoke_and_assert,
-        ["block", "inspect", "json/pleasedonterase"],
+        ["block", "inspect", "secret/pleasedonterase"],
         expected_code=1,
     )
 

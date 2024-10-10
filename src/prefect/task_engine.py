@@ -55,11 +55,12 @@ from prefect.exceptions import (
 )
 from prefect.futures import PrefectFuture
 from prefect.logging.loggers import get_logger, patch_print, task_run_logger
-from prefect.records.result_store import ResultRecordStore
 from prefect.results import (
     BaseResult,
+    ResultRecord,
     _format_user_supplied_storage_key,
-    get_current_result_store,
+    get_result_store,
+    should_persist_result,
 )
 from prefect.settings import (
     PREFECT_DEBUG_MODE,
@@ -76,7 +77,7 @@ from prefect.states import (
     exception_to_failed_state,
     return_value_to_state,
 )
-from prefect.transactions import Transaction, transaction
+from prefect.transactions import IsolationLevel, Transaction, transaction
 from prefect.utilities.annotations import NotSet
 from prefect.utilities.asyncutils import run_coro_as_sync
 from prefect.utilities.callables import call_with_parameters, parameters_to_args_kwargs
@@ -363,7 +364,6 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         new_state = Running()
 
         self.task_run.start_time = new_state.timestamp
-        self.task_run.run_count += 1
 
         flow_run_context = FlowRunContext.get()
         if flow_run_context and flow_run_context.flow_run:
@@ -411,6 +411,9 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         self.task_run.state_type = new_state.type
         self.task_run.state_name = new_state.name
 
+        if new_state.is_running():
+            self.task_run.run_count += 1
+
         if new_state.is_final():
             if isinstance(state.data, BaseResult) and state.data.has_cached_object():
                 # Avoid fetching the result unless it is cached, otherwise we defeat
@@ -418,6 +421,8 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
                 result = state.result(raise_on_failure=False, fetch=True)
                 if inspect.isawaitable(result):
                     result = run_coro_as_sync(result)
+            elif isinstance(state.data, ResultRecord):
+                result = state.data.result
             else:
                 result = state.data
 
@@ -441,7 +446,8 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
                 if inspect.isawaitable(_result):
                     _result = run_coro_as_sync(_result)
                 return _result
-
+            elif isinstance(self._return_value, ResultRecord):
+                return self._return_value.result
             # otherwise, return the value as is
             return self._return_value
 
@@ -454,10 +460,6 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             return self._raised
 
     def handle_success(self, result: R, transaction: Transaction) -> R:
-        result_store = getattr(TaskRunContext.get(), "result_store", None)
-        if result_store is None:
-            raise ValueError("Result store is not set")
-
         if self.task.cache_expiration is not None:
             expiration = pendulum.now("utc") + self.task.cache_expiration
         else:
@@ -466,7 +468,7 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         terminal_state = run_coro_as_sync(
             return_value_to_state(
                 result,
-                result_store=result_store,
+                result_store=get_result_store(),
                 key=transaction.key,
                 expiration=expiration,
             )
@@ -511,7 +513,6 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             else:
                 delay = None
                 new_state = Retrying()
-                self.task_run.run_count += 1
 
             self.logger.info(
                 "Task run failed with exception: %r - " "Retry %s/%s will start %s",
@@ -538,12 +539,11 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         # If the task fails, and we have retries left, set the task to retrying.
         if not self.handle_retry(exc):
             # If the task has no retries left, or the retry condition is not met, set the task to failed.
-            context = TaskRunContext.get()
             state = run_coro_as_sync(
                 exception_to_failed_state(
                     exc,
                     message="Task run encountered an exception",
-                    result_store=getattr(context, "result_store", None),
+                    result_store=get_result_store(),
                     write_result=True,
                 )
             )
@@ -595,10 +595,13 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
                     log_prints=log_prints,
                     task_run=self.task_run,
                     parameters=self.parameters,
-                    result_store=get_current_result_store().update_for_task(
+                    result_store=get_result_store().update_for_task(
                         self.task, _sync=True
                     ),
                     client=client,
+                    persist_result=self.task.persist_result
+                    if self.task.persist_result is not None
+                    else should_persist_result(),
                 )
             )
             stack.enter_context(ConcurrencyContextV1())
@@ -655,7 +658,7 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
 
                     with self.setup_run_context():
                         # setup_run_context might update the task run name, so log creation here
-                        self.logger.info(
+                        self.logger.debug(
                             f"Created task run {self.task_run.name!r} for task {self.task.name!r}"
                         )
                         yield self
@@ -690,8 +693,9 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         if scheduled_time := self.state.state_details.scheduled_time:
             sleep_time = (scheduled_time - pendulum.now("utc")).total_seconds()
             await anyio.sleep(sleep_time if sleep_time > 0 else 0)
+            new_state = Retrying() if self.state.name == "AwaitingRetry" else Running()
             self.set_state(
-                Retrying() if self.state.name == "AwaitingRetry" else Running(),
+                new_state,
                 force=True,
             )
 
@@ -723,17 +727,21 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             else PREFECT_TASKS_REFRESH_CACHE.value()
         )
 
-        result_store = getattr(TaskRunContext.get(), "result_store", None)
-        if result_store and result_store.persist_result:
-            store = ResultRecordStore(result_store=result_store)
-        else:
-            store = None
+        isolation_level = (
+            IsolationLevel(self.task.cache_policy.isolation_level)
+            if self.task.cache_policy
+            and self.task.cache_policy is not NotSet
+            and self.task.cache_policy.isolation_level is not None
+            else None
+        )
 
         with transaction(
             key=self.compute_transaction_key(),
-            store=store,
+            store=get_result_store(),
             overwrite=overwrite,
             logger=self.logger,
+            write_on_commit=should_persist_result(),
+            isolation_level=isolation_level,
         ) as txn:
             yield txn
 
@@ -769,10 +777,10 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         if transaction.is_committed():
             result = transaction.read()
         else:
-            if self.task.tags:
+            if self.task_run.tags:
                 # Acquire a concurrency slot for each tag, but only if a limit
                 # matching the tag already exists.
-                with concurrency(list(self.task.tags), self.task_run.id):
+                with concurrency(list(self.task_run.tags), self.task_run.id):
                     result = call_with_parameters(self.task.fn, parameters)
             else:
                 result = call_with_parameters(self.task.fn, parameters)
@@ -877,7 +885,6 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         new_state = Running()
 
         self.task_run.start_time = new_state.timestamp
-        self.task_run.run_count += 1
 
         flow_run_context = FlowRunContext.get()
         if flow_run_context:
@@ -925,6 +932,9 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         self.task_run.state_type = new_state.type
         self.task_run.state_name = new_state.name
 
+        if new_state.is_running():
+            self.task_run.run_count += 1
+
         if new_state.is_final():
             if (
                 isinstance(new_state.data, BaseResult)
@@ -933,6 +943,8 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
                 # Avoid fetching the result unless it is cached, otherwise we defeat
                 # the purpose of disabling `cache_result_in_memory`
                 result = await new_state.result(raise_on_failure=False, fetch=True)
+            elif isinstance(new_state.data, ResultRecord):
+                result = new_state.data.result
             else:
                 result = new_state.data
 
@@ -953,7 +965,8 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             # if the return value is a BaseResult, we need to fetch it
             if isinstance(self._return_value, BaseResult):
                 return await self._return_value.get()
-
+            elif isinstance(self._return_value, ResultRecord):
+                return self._return_value.result
             # otherwise, return the value as is
             return self._return_value
 
@@ -966,10 +979,6 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             return self._raised
 
     async def handle_success(self, result: R, transaction: Transaction) -> R:
-        result_store = getattr(TaskRunContext.get(), "result_store", None)
-        if result_store is None:
-            raise ValueError("Result store is not set")
-
         if self.task.cache_expiration is not None:
             expiration = pendulum.now("utc") + self.task.cache_expiration
         else:
@@ -977,7 +986,7 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
 
         terminal_state = await return_value_to_state(
             result,
-            result_store=result_store,
+            result_store=get_result_store(),
             key=transaction.key,
             expiration=expiration,
         )
@@ -1021,7 +1030,6 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             else:
                 delay = None
                 new_state = Retrying()
-                self.task_run.run_count += 1
 
             self.logger.info(
                 "Task run failed with exception: %r - " "Retry %s/%s will start %s",
@@ -1048,11 +1056,10 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         # If the task fails, and we have retries left, set the task to retrying.
         if not await self.handle_retry(exc):
             # If the task has no retries left, or the retry condition is not met, set the task to failed.
-            context = TaskRunContext.get()
             state = await exception_to_failed_state(
                 exc,
                 message="Task run encountered an exception",
-                result_store=getattr(context, "result_store", None),
+                result_store=get_result_store(),
             )
             self.record_terminal_state_timing(state)
             await self.set_state(state)
@@ -1102,10 +1109,13 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
                     log_prints=log_prints,
                     task_run=self.task_run,
                     parameters=self.parameters,
-                    result_store=await get_current_result_store().update_for_task(
+                    result_store=await get_result_store().update_for_task(
                         self.task, _sync=False
                     ),
                     client=client,
+                    persist_result=self.task.persist_result
+                    if self.task.persist_result is not None
+                    else should_persist_result(),
                 )
             )
             stack.enter_context(ConcurrencyContext())
@@ -1157,7 +1167,7 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
 
                     async with self.setup_run_context():
                         # setup_run_context might update the task run name, so log creation here
-                        self.logger.info(
+                        self.logger.debug(
                             f"Created task run {self.task_run.name!r} for task {self.task.name!r}"
                         )
                         yield self
@@ -1192,8 +1202,9 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         if scheduled_time := self.state.state_details.scheduled_time:
             sleep_time = (scheduled_time - pendulum.now("utc")).total_seconds()
             await anyio.sleep(sleep_time if sleep_time > 0 else 0)
+            new_state = Retrying() if self.state.name == "AwaitingRetry" else Running()
             await self.set_state(
-                Retrying() if self.state.name == "AwaitingRetry" else Running(),
+                new_state,
                 force=True,
             )
 
@@ -1226,17 +1237,21 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             if self.task.refresh_cache is not None
             else PREFECT_TASKS_REFRESH_CACHE.value()
         )
-        result_store = getattr(TaskRunContext.get(), "result_store", None)
-        if result_store and result_store.persist_result:
-            store = ResultRecordStore(result_store=result_store)
-        else:
-            store = None
+        isolation_level = (
+            IsolationLevel(self.task.cache_policy.isolation_level)
+            if self.task.cache_policy
+            and self.task.cache_policy is not NotSet
+            and self.task.cache_policy.isolation_level is not None
+            else None
+        )
 
         with transaction(
             key=self.compute_transaction_key(),
-            store=store,
+            store=get_result_store(),
             overwrite=overwrite,
             logger=self.logger,
+            write_on_commit=should_persist_result(),
+            isolation_level=isolation_level,
         ) as txn:
             yield txn
 
@@ -1272,10 +1287,10 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
         if transaction.is_committed():
             result = transaction.read()
         else:
-            if self.task.tags:
+            if self.task_run.tags:
                 # Acquire a concurrency slot for each tag, but only if a limit
                 # matching the tag already exists.
-                async with aconcurrency(list(self.task.tags), self.task_run.id):
+                async with aconcurrency(list(self.task_run.tags), self.task_run.id):
                     result = await call_with_parameters(self.task.fn, parameters)
             else:
                 result = await call_with_parameters(self.task.fn, parameters)
